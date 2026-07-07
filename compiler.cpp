@@ -396,7 +396,10 @@ namespace pe {
     constexpr uint32_t FILE_ALIGN       = 0x200;
     constexpr uint32_t HEADERS_SIZE    = 0x200;
     constexpr uint32_t TEXT_RVA        = 0x1000;
-    constexpr uint32_t IDATA_RVA       = 0x2000;
+    // IDATA_RVA is no longer a fixed constant — it is computed dynamically
+    // as TEXT_RVA + round_up(text_virt_size, SEC_ALIGN) so that the .idata
+    // section never overlaps .text in virtual memory. This is critical when
+    // the code section is large (e.g. millions of show() calls).
     constexpr uint32_t SC_CODE         = 0x60000020;
     constexpr uint32_t SC_IDATA        = 0xC0000040;
 
@@ -435,197 +438,135 @@ static std::vector<uint8_t> build_pe(const std::vector<ShowStatement>& shows,
     const uint32_t data_off    = off; off += dl.total;
     const uint32_t idata_size  = off;
 
-    auto idata_rva = [&](uint32_t o) { return IDATA_RVA + o; };
+    // ---- code generation ----
+    // IDATA_RVA must be computed dynamically: it follows the .text section
+    // in virtual memory. We emit the code once with a dummy IDATA_RVA to
+    // measure the code size, then compute the real IDATA_RVA and re-emit.
+    // This is safe because instruction lengths are fixed regardless of the
+    // displacement values, so both passes produce identical code size.
 
-    // ---- code ----
-    uint32_t code_rva = TEXT_RVA;
-    std::vector<uint8_t> code;
+    auto emit_code = [&](uint32_t idata_rva_val) -> std::vector<uint8_t> {
+        auto idata_rva = [&](uint32_t o) { return idata_rva_val + o; };
+        uint32_t code_rva = TEXT_RVA;
 
-    if (!is_arm64) {
-        // ===== x86_64 =====
-        X64Code pc;
-        pc.push_rbx();             // 53
-        pc.sub_rsp(48);            // 48 83 EC 30
-        // GetStdHandle(STD_OUTPUT_HANDLE)
-        pc.mov_ecx(STD_OUT);       // B9 F5 FF FF FF
-        pc.call_rip(idata_rva(iat_off + pe::IDX_GSH * 8), code_rva);
-        pc.mov_rbx_rax();          // 48 89 C3  (hOut in rbx)
-        // For each show: WriteFile(hOut, text, len, &written, NULL)
-        for (size_t k = 0; k < shows.size(); k++) {
-            pc.mov_rcx_rbx();     // 48 89 D9
-            pc.lea_rdx_rip(idata_rva(data_off + dl.show_offs[k]), code_rva);
-            pc.mov_edx((uint32_t)(shows[k].text.size() + 1)); // +1 for \n
-            // Wait — mov_edx overwrites rdx from lea. Fix: use r8 for len.
-            // Actually lea sets rdx; then we need r8 = len. Let me reorder:
-            // lea rdx first, then mov r8d, len.
-            // (The mov_edx above is wrong — it clobbers rdx. Remove it.)
-        }
-        // Re-emit correctly: lea rdx, mov r8d, len; lea r9, &written; 5th=NULL; call
-        code.clear();
-        // Rebuild from scratch with correct ordering.
-        // [restart]
-        // push rbx; sub rsp,48
-        pc.c.b.clear();
-        pc.push_rbx();
-        pc.sub_rsp(48);
-        // GetStdHandle(STD_OUTPUT_HANDLE)
-        pc.mov_ecx(STD_OUT);
-        pc.call_rip(idata_rva(iat_off + pe::IDX_GSH * 8), code_rva);
-        pc.mov_rbx_rax();
-        // Each show
-        for (size_t k = 0; k < shows.size(); k++) {
-            pc.mov_rcx_rbx();                                              // rcx = hOut
-            pc.lea_rdx_rip(idata_rva(data_off + dl.show_offs[k]), code_rva); // rdx = &text
-            // r8 = len (text + 1 for \n)
-            // mov r8d, imm32: 41 B8 id
-            pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32((uint32_t)(shows[k].text.size() + 1));
-            pc.lea_r9_rip(idata_rva(written_off), code_rva);               // r9 = &written
-            pc.movq_rsp_zero(32);                                          // [rsp+32] = 0 (5th arg)
-            pc.call_rip(idata_rva(iat_off + pe::IDX_WF * 8), code_rva);
-        }
-        // Print prompt
-        pc.mov_rcx_rbx();
-        pc.lea_rdx_rip(idata_rva(data_off + dl.prompt_off), code_rva);
-        pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32((uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
-        pc.lea_r9_rip(idata_rva(written_off), code_rva);
-        pc.movq_rsp_zero(32);
-        pc.call_rip(idata_rva(iat_off + pe::IDX_WF * 8), code_rva);
-        // GetStdHandle(STD_INPUT_HANDLE)
-        pc.mov_ecx(STD_IN);
-        pc.call_rip(idata_rva(iat_off + pe::IDX_GSH * 8), code_rva);
-        pc.mov_rcx_rax();   // hIn
-        // ReadFile(hIn, buf, 1, &read, NULL)
-        // lea rdx, [rsp+40]: 48 8D 54 24 28
-        pc.c.u8(0x48); pc.c.u8(0x8D); pc.c.u8(0x54); pc.c.u8(0x24); pc.c.u8(0x28);
-        pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32(1);     // r8 = 1
-        pc.lea_r9_rip(idata_rva(read_off), code_rva);
-        pc.movq_rsp_zero(32);
-        pc.call_rip(idata_rva(iat_off + pe::IDX_RF * 8), code_rva);
-        // ExitProcess(0)
-        pc.xor_eax();
-        pc.mov_rcx_rax();
-        pc.call_rip(idata_rva(iat_off + pe::IDX_EP * 8), code_rva);
-        // Fallback
-        pc.add_rsp(48);
-        pc.pop_rbx();
-        pc.ret();
-        code = pc.c.b;
-    } else {
-        // ===== ARM64 Windows =====
-        // Windows ARM64 calling convention: x0-x3 args, x4-x7 more,
-        // x9-x15 volatile, x19-x28 callee-saved.
-        // We use x19 to save hOut.
-        Arm64Code ac;
-        // prologue: stp x29,x30,[sp,#-32]! would be ideal, but let's keep
-        // it simple: sub sp, sp, #48; str x19, [sp, #32]; stp x29,x30,[sp,#16]
-        // Actually for Windows ARM64 we can use a simple frame:
-        // sub sp, sp, #64; save x19 at [sp,#32], x29/x30 at [sp,#40]/[sp,#48]
-        ac.sub_sp(64);           // sp -= 64 (16 bytes * 4)
-        ac.str_sp(19, 4);        // [sp+32] = x19  (save)
-        ac.str_sp(29, 5);        // [sp+40] = x29
-        ac.str_sp(30, 6);        // [sp+48] = x30
-
-        // GetStdHandle(STD_OUTPUT_HANDLE) -> x0
-        // STD_OUTPUT_HANDLE = -11 = 0xFFFFFFF5
-        ac.mov_imm32(0, (uint32_t)STD_OUT);   // x0 = -11 (as unsigned, but movz/movk loads 0xFFFFFFF5)
-        // For -11 we need 0xFFFFFFFFFFFFFFF5 as 64-bit. mov_imm32 loads 32-bit
-        // zero-extended, so 0xFFFFFFF5. But GetStdHandle takes a DWORD, so
-        // it reads only the low 32 bits. That's fine.
-        // Actually Windows ARM64 passes args in x0 as 64-bit. -11 as i32 is
-        // 0xFFFFFFF5, zero-extended to 64-bit = 0x00000000FFFFFFF5. GetStdHandle
-        // interprets it as DWORD (32-bit), so it works.
-        // bl to the IAT thunk... but ARM64 PE uses a stub: we need to emit
-        // a "ldr x16, [pc+8]; br x16; .quad IAT_entry" pattern for each call.
-        // That's complex. For simplicity, we emit inline thunks.
-        // Actually Windows ARM64 PE IAT calls go through stubs in .text.
-        // Let's emit the call-stub pattern inline before each call.
-        // But we need to know the IAT RVA to compute the address.
-        // The IAT is in .idata. We can load the absolute address using
-        // adrp+add if we know the page. But with ASLR off and image base
-        // 0x400000, the IAT VA = 0x400000 + IDATA_RVA + iat_off + idx*8.
-        // We can use mov_imm64 to load the full 64-bit VA.
-        // This is simpler but not position-independent. Since we disabled
-        // ASLR, it works. For now, use absolute addresses.
-
-        auto call_iat_arm64 = [&](uint32_t iat_slot_off) {
-            uint64_t iat_va = IMAGE_BASE + IDATA_RVA + iat_slot_off;
-            // mov x16, iat_va (64-bit)
-            ac.mov_imm64(16, iat_va);
-            // ldr x16, [x16]  -> 0xF9400000 | (16<<5) | 16 = 0xF9400210
-            // Wait: ldr x16, [x16] is 0xF9400210? Let me compute:
-            //   ldr x16, [x16, #0] = 0xF9400000 | (0 << 10) | (16 << 5) | 16
-            //   = 0xF9400000 | 0x200 | 0x10 = 0xF9400210
-            ac.insn(0xF9400210);
-            // br x16
-            ac.br(16);
-        };
-
-        call_iat_arm64(iat_off + pe::IDX_GSH * 8);
-        // x0 = hOut; save to x19
-        ac.mov_reg(19, 0);  // mov x19, x0
-
-        // For each show: WriteFile(hOut, text, len, &written, NULL)
-        // x0=hOut, x1=&text, x2=len, x3=&written, x4=NULL(0), 5th+ on stack
-        for (size_t k = 0; k < shows.size(); k++) {
-            ac.mov_reg(0, 19);  // x0 = hOut
-            // x1 = &text (adr or adrp+add). Use adrp+add.
-            // data is at IDATA_RVA + data_off + dl.show_offs[k]
-            // We need a PC-relative load of the address. Since code is at
-            // TEXT_RVA and data at IDATA_RVA, the offset is ~0x1000+data.
-            // adrp can reach ±4GB, so it's fine.
-            // But adrp needs page-aligned offset. Let's just use mov_imm64
-            // with the absolute VA (no ASLR).
-            {
-                uint64_t text_va = IMAGE_BASE + IDATA_RVA + data_off + dl.show_offs[k];
-                ac.mov_imm64(1, text_va);   // x1 = &text
+        if (!is_arm64) {
+            // ===== x86_64 =====
+            X64Code pc;
+            pc.push_rbx();
+            pc.sub_rsp(48);
+            // GetStdHandle(STD_OUTPUT_HANDLE)
+            pc.mov_ecx(STD_OUT);
+            pc.call_rip(idata_rva(iat_off + pe::IDX_GSH * 8), code_rva);
+            pc.mov_rbx_rax();
+            // Each show: WriteFile(hOut, text, len, &written, NULL)
+            for (size_t k = 0; k < shows.size(); k++) {
+                pc.mov_rcx_rbx();
+                pc.lea_rdx_rip(idata_rva(data_off + dl.show_offs[k]), code_rva);
+                pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32((uint32_t)(shows[k].text.size() + 1));
+                pc.lea_r9_rip(idata_rva(written_off), code_rva);
+                pc.movq_rsp_zero(32);
+                pc.call_rip(idata_rva(iat_off + pe::IDX_WF * 8), code_rva);
             }
-            ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1)); // x2 = len
-            // x3 = &written (absolute VA)
-            ac.mov_imm64(3, IMAGE_BASE + IDATA_RVA + written_off);
-            // x4 = 0 (NULL for lpOverlapped)
+            // Print prompt
+            pc.mov_rcx_rbx();
+            pc.lea_rdx_rip(idata_rva(data_off + dl.prompt_off), code_rva);
+            pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32((uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
+            pc.lea_r9_rip(idata_rva(written_off), code_rva);
+            pc.movq_rsp_zero(32);
+            pc.call_rip(idata_rva(iat_off + pe::IDX_WF * 8), code_rva);
+            // GetStdHandle(STD_INPUT_HANDLE)
+            pc.mov_ecx(STD_IN);
+            pc.call_rip(idata_rva(iat_off + pe::IDX_GSH * 8), code_rva);
+            pc.mov_rcx_rax();
+            // ReadFile(hIn, buf, 1, &read, NULL)
+            pc.c.u8(0x48); pc.c.u8(0x8D); pc.c.u8(0x54); pc.c.u8(0x24); pc.c.u8(0x28);
+            pc.c.u8(0x41); pc.c.u8(0xB8); pc.c.u32(1);
+            pc.lea_r9_rip(idata_rva(read_off), code_rva);
+            pc.movq_rsp_zero(32);
+            pc.call_rip(idata_rva(iat_off + pe::IDX_RF * 8), code_rva);
+            // ExitProcess(0)
+            pc.xor_eax();
+            pc.mov_rcx_rax();
+            pc.call_rip(idata_rva(iat_off + pe::IDX_EP * 8), code_rva);
+            // Fallback
+            pc.add_rsp(48);
+            pc.pop_rbx();
+            pc.ret();
+            return pc.c.b;
+        } else {
+            // ===== ARM64 Windows =====
+            Arm64Code ac;
+            ac.sub_sp(64);
+            ac.str_sp(19, 4);
+            ac.str_sp(29, 5);
+            ac.str_sp(30, 6);
+
+            auto call_iat_arm64 = [&](uint32_t iat_slot_off) {
+                uint64_t iat_va = IMAGE_BASE + idata_rva_val + iat_slot_off;
+                ac.mov_imm64(16, iat_va);
+                ac.insn(0xF9400210);  // ldr x16, [x16]
+                ac.br(16);
+            };
+
+            // GetStdHandle(STD_OUTPUT_HANDLE)
+            ac.mov_imm32(0, (uint32_t)STD_OUT);
+            call_iat_arm64(iat_off + pe::IDX_GSH * 8);
+            ac.mov_reg(19, 0);
+
+            for (size_t k = 0; k < shows.size(); k++) {
+                ac.mov_reg(0, 19);
+                ac.mov_imm64(1, IMAGE_BASE + idata_rva_val + data_off + dl.show_offs[k]);
+                ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1));
+                ac.mov_imm64(3, IMAGE_BASE + idata_rva_val + written_off);
+                ac.movz(4, 0);
+                call_iat_arm64(iat_off + pe::IDX_WF * 8);
+            }
+
+            // Prompt
+            ac.mov_reg(0, 19);
+            ac.mov_imm64(1, IMAGE_BASE + idata_rva_val + data_off + dl.prompt_off);
+            ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
+            ac.mov_imm64(3, IMAGE_BASE + idata_rva_val + written_off);
             ac.movz(4, 0);
-            // For Windows ARM64, the 5th arg (lpOverlapped) goes in x4.
-            // WriteFile has 5 args: hFile, lpBuffer, nBytes, lpBytesWritten, lpOverlapped.
-            // So x0=hOut, x1=buf, x2=len, x3=&written, x4=NULL.
             call_iat_arm64(iat_off + pe::IDX_WF * 8);
+
+            // GetStdHandle(STD_INPUT_HANDLE)
+            ac.mov_imm32(0, (uint32_t)STD_IN);
+            call_iat_arm64(iat_off + pe::IDX_GSH * 8);
+
+            // ReadFile(hIn, buf, 1, &read, NULL)
+            ac.insn(0x910003E1);  // mov x1, sp
+            ac.mov_imm32(2, 1);
+            ac.mov_imm64(3, IMAGE_BASE + idata_rva_val + read_off);
+            ac.movz(4, 0);
+            call_iat_arm64(iat_off + pe::IDX_RF * 8);
+
+            // ExitProcess(0)
+            ac.movz(0, 0);
+            call_iat_arm64(iat_off + pe::IDX_EP * 8);
+
+            // Fallback
+            ac.ldr_sp(19, 4);
+            ac.ldr_sp(29, 5);
+            ac.ldr_sp(30, 6);
+            ac.add_sp(64);
+            ac.ret();
+            return ac.c.b;
         }
+    };
 
-        // Print prompt
-        ac.mov_reg(0, 19);  // x0 = hOut
-        ac.mov_imm64(1, IMAGE_BASE + IDATA_RVA + data_off + dl.prompt_off);
-        ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
-        ac.mov_imm64(3, IMAGE_BASE + IDATA_RVA + written_off);
-        ac.movz(4, 0);
-        call_iat_arm64(iat_off + pe::IDX_WF * 8);
+    // Pass 1: emit with dummy IDATA_RVA to measure code size.
+    std::vector<uint8_t> code_tmp = emit_code(0x10000);  // dummy value
+    uint32_t text_size_tmp = (uint32_t)code_tmp.size();
+    uint32_t text_virt_tmp = text_size_tmp;
+    while (text_virt_tmp & (SEC_ALIGN - 1)) text_virt_tmp++;
 
-        // GetStdHandle(STD_INPUT_HANDLE) -> x0
-        ac.mov_imm32(0, (uint32_t)STD_IN);
-        call_iat_arm64(iat_off + pe::IDX_GSH * 8);
-        // x0 = hIn
+    // Compute the real IDATA_RVA: .text ends at TEXT_RVA + text_virt_tmp,
+    // .idata starts at the next page-aligned address after that.
+    const uint32_t IDATA_RVA = TEXT_RVA + text_virt_tmp;
 
-        // ReadFile(hIn, buf, 1, &read, NULL)
-        // x0=hIn, x1=&buf (on stack at [sp+0]), x2=1, x3=&read, x4=NULL
-        ac.mov_reg(0, 0);   // x0 = hIn (already in x0)
-        // x1 = sp (lea x1, [sp])
-        // add x1, sp, #0  -> 0x910003E1
-        ac.insn(0x910003E1);
-        ac.mov_imm32(2, 1);
-        ac.mov_imm64(3, IMAGE_BASE + IDATA_RVA + read_off);
-        ac.movz(4, 0);
-        call_iat_arm64(iat_off + pe::IDX_RF * 8);
-
-        // ExitProcess(0)
-        ac.movz(0, 0);  // x0 = 0
-        call_iat_arm64(iat_off + pe::IDX_EP * 8);
-
-        // Fallback: restore and return
-        ac.ldr_sp(19, 4);
-        ac.ldr_sp(29, 5);
-        ac.ldr_sp(30, 6);
-        ac.add_sp(64);
-        ac.ret();
-        code = ac.c.b;
-    }
+    // Pass 2: re-emit with the correct IDATA_RVA.
+    std::vector<uint8_t> code = emit_code(IDATA_RVA);
 
     // ---- sizes ----
     uint32_t text_size = (uint32_t)code.size();
@@ -721,14 +662,14 @@ static std::vector<uint8_t> build_pe(const std::vector<ShowStatement>& shows,
         memcpy(&img[idata_file+wo], s, n);
     };
     // IDT
-    iput32(0,  idata_rva(iat_off));     // OriginalFirstThunk
+    iput32(0,  IDATA_RVA + iat_off);     // OriginalFirstThunk
     iput32(4,  0);
     iput32(8,  0);
-    iput32(12, idata_rva(dllname_off)); // Name
-    iput32(16, idata_rva(iat_off));     // FirstThunk
+    iput32(12, IDATA_RVA + dllname_off); // Name
+    iput32(16, IDATA_RVA + iat_off);     // FirstThunk
     // IAT
     for (size_t k = 0; k < kNumImports; k++) {
-        iput32(iat_off + k*8,     idata_rva(inr_offs[k]));
+        iput32(iat_off + k*8,     IDATA_RVA + inr_offs[k]);
         iput32(iat_off + k*8 + 4, 0);
     }
     iput32(iat_off + kNumImports*8,     0);  // null terminator
@@ -807,108 +748,89 @@ static std::vector<uint8_t> build_elf(const std::vector<ShowStatement>& shows,
     const uint32_t HDRS = EHDR_SIZE + 2 * PHDR_SIZE;   // 64 + 112 = 176 (0xB0)
     const uint32_t CODE_OFF = HDRS;                     // code starts right after headers
 
-    // Generate code
-    std::vector<uint8_t> code;
-
-    if (!is_arm64) {
-        // ===== x86_64 Linux syscalls =====
-        // Linux x86_64 syscall convention:
-        //   rax = syscall number
-        //   rdi = arg1, rsi = arg2, rdx = arg3
-        //   syscall
-        // Data is placed at file offset 0x1000 (page-aligned), VA = BASE+0x1000.
-        // Code starts at file offset HDRS (0x78), VA = BASE+0x78.
-        // lea_rsi_rip(data_rva, code_base_rva) computes the displacement as:
-        //   disp = data_rva - (code_base_rva + cur_code_size + 7)
-        // so we pass CODE_OFF as the base and it adds the current emit position.
-        X64Code pc;
-        const uint32_t DATA_RVA = 0x1000;  // data at file/VA offset 0x1000
-
-        for (size_t k = 0; k < shows.size(); k++) {
-            pc.mov_eax(X64_WRITE);          // rax = 1 (write)
-            pc.mov_edi(1);                   // rdi = 1 (stdout)
-            pc.lea_rsi_rip(DATA_RVA + dl.show_offs[k], CODE_OFF);  // rsi = &text
-            pc.mov_edx((uint32_t)(shows[k].text.size() + 1)); // rdx = len (+1 for \n)
-            pc.syscall();
-        }
-        // Print prompt
-        {
+    // Two-pass code generation: emit with a dummy DATA_RVA to measure code
+    // size, then compute the real DATA_RVA (page-aligned, after code) and
+    // re-emit. Instruction lengths are fixed so both passes produce the
+    // same code size.
+    auto emit_elf_code = [&](uint32_t data_rva) -> std::vector<uint8_t> {
+        if (!is_arm64) {
+            // ===== x86_64 Linux syscalls =====
+            X64Code pc;
+            for (size_t k = 0; k < shows.size(); k++) {
+                pc.mov_eax(X64_WRITE);
+                pc.mov_edi(1);
+                pc.lea_rsi_rip(data_rva + dl.show_offs[k], CODE_OFF);
+                pc.mov_edx((uint32_t)(shows[k].text.size() + 1));
+                pc.syscall();
+            }
+            // Prompt
             pc.mov_eax(X64_WRITE);
             pc.mov_edi(1);
-            pc.lea_rsi_rip(DATA_RVA + dl.prompt_off, CODE_OFF);
+            pc.lea_rsi_rip(data_rva + dl.prompt_off, CODE_OFF);
             pc.mov_edx((uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
             pc.syscall();
-        }
-        // Read(0, buf, 1) — wait for Enter
-        {
+            // Read(0, buf, 1)
             pc.mov_eax(X64_READ);
-            pc.mov_edi(0);   // stdin
+            pc.mov_edi(0);
             pc.sub_rsp(16);
-            // lea rsi, [rsp] = 48 8D 34 24
             pc.c.u8(0x48); pc.c.u8(0x8D); pc.c.u8(0x34); pc.c.u8(0x24);
             pc.mov_edx(1);
             pc.syscall();
             pc.add_rsp(16);
-        }
-        // exit(0)
-        {
+            // exit(0)
             pc.mov_eax(X64_EXIT);
             pc.xor_edi();
             pc.syscall();
-        }
-        code = pc.c.b;
-    } else {
-        // ===== ARM64 Linux syscalls =====
-        // Linux ARM64 syscall convention:
-        //   x8 = syscall number
-        //   x0 = arg1, x1 = arg2, x2 = arg3
-        //   svc #0
-        Arm64Code ac;
-        // Data at file offset 0x1000, VA = BASE + 0x1000
-        const uint64_t DATA_VA = BASE + 0x1000;
-        for (size_t k = 0; k < shows.size(); k++) {
-            ac.mov_x8_imm(A64_WRITE);   // x8 = 64 (write)
-            ac.movz(0, 1);              // x0 = 1 (stdout)
-            // x1 = &text (use mov_imm64 with absolute VA since no ASLR... but
-            // Linux ELF executables with ET_EXEC load at fixed VA, so this works)
-            ac.mov_imm64(1, DATA_VA + dl.show_offs[k]);
-            ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1));
+            return pc.c.b;
+        } else {
+            // ===== ARM64 Linux syscalls =====
+            Arm64Code ac;
+            const uint64_t DATA_VA = BASE + data_rva;
+            for (size_t k = 0; k < shows.size(); k++) {
+                ac.mov_x8_imm(A64_WRITE);
+                ac.movz(0, 1);
+                ac.mov_imm64(1, DATA_VA + dl.show_offs[k]);
+                ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1));
+                ac.svc();
+            }
+            // Prompt
+            ac.mov_x8_imm(A64_WRITE);
+            ac.movz(0, 1);
+            ac.mov_imm64(1, DATA_VA + dl.prompt_off);
+            ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
             ac.svc();
+            // Read(0, buf, 1)
+            ac.mov_x8_imm(A64_READ);
+            ac.movz(0, 0);
+            ac.sub_sp(16);
+            ac.insn(0x910003E1);
+            ac.mov_imm32(2, 1);
+            ac.svc();
+            ac.add_sp(16);
+            // exit(0)
+            ac.mov_x8_imm(A64_EXIT);
+            ac.movz(0, 0);
+            ac.svc();
+            return ac.c.b;
         }
-        // Prompt
-        ac.mov_x8_imm(A64_WRITE);
-        ac.movz(0, 1);
-        ac.mov_imm64(1, DATA_VA + dl.prompt_off);
-        ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
-        ac.svc();
-        // Read(0, buf, 1)
-        ac.mov_x8_imm(A64_READ);
-        ac.movz(0, 0);   // stdin
-        // x1 = sp (sub sp first)
-        ac.sub_sp(16);
-        // mov x1, sp -> add x1, sp, #0 = 0x910003E1
-        ac.insn(0x910003E1);
-        ac.mov_imm32(2, 1);
-        ac.svc();
-        ac.add_sp(16);
-        // exit(0)
-        ac.mov_x8_imm(A64_EXIT);
-        ac.movz(0, 0);
-        ac.svc();
-        code = ac.c.b;
-    }
+    };
 
-    // Layout:
-    //   ELF header             64 bytes (offset 0)
-    //   PHDR #0 (PT_LOAD)      56 bytes (offset 64)
-    //   PHDR #1 (PT_GNU_STACK) 56 bytes (offset 120)
-    //   = total headers = 176 (0xB0)
-    //   Code at offset 0xB0, data at offset 0x1000 (page-aligned).
-    //   The PT_LOAD segment covers the entire file (RWX) so both code and
-    //   data are mapped. PT_GNU_STACK marks the stack as non-executable,
-    //   which prevents the kernel from applying READ_IMPLIES_EXEC.
-    const uint32_t DATA_OFF = 0x1000;
-    const uint32_t CODE_OFF_ACTUAL = HDRS;  // 0xB0
+    // Pass 1: measure code size with dummy data RVA.
+    std::vector<uint8_t> code_tmp = emit_elf_code(0x10000);
+    uint32_t code_size = (uint32_t)code_tmp.size();
+
+    // Compute DATA_OFF: page-aligned, after code.
+    // Code starts at file offset HDRS; data must not overlap code.
+    uint32_t data_off_val = HDRS + code_size;
+    // Round up to page alignment (0x1000).
+    while (data_off_val & 0xFFF) data_off_val++;
+
+    // Pass 2: re-emit with the correct data RVA.
+    std::vector<uint8_t> code = emit_elf_code(data_off_val);
+
+    // Layout: data at a page-aligned offset after code (computed dynamically).
+    const uint32_t DATA_OFF = data_off_val;
+    const uint32_t CODE_OFF_ACTUAL = HDRS;
     const uint64_t CODE_VA  = BASE + CODE_OFF_ACTUAL;
     const uint64_t DATA_VA  = BASE + DATA_OFF;
     const uint32_t FILE_SIZE = DATA_OFF + (uint32_t)data.size();
@@ -1028,91 +950,113 @@ static std::vector<uint8_t> build_macho(const std::vector<ShowStatement>& shows,
     //   - LC_UNIXTHREAD for x86_64, or just set entry point
 
     const uint64_t TEXT_VMADDR = 0x100000000;   // typical macOS base
-    const uint64_t DATA_VMADDR = 0x100001000;   // next page
     const uint32_t PAGE = 0x1000;
 
-    // Generate code
-    std::vector<uint8_t> code;
+    // Two-pass: emit code with dummy DATA_VMADDR, measure size, compute real
+    // DATA_VMADDR (after __TEXT segment, page-aligned), re-emit.
+    // The Mach-O __TEXT segment file size must be large enough to hold
+    // header + load commands + code. The __DATA segment follows in the
+    // next page(s).
 
-    if (!is_arm64) {
-        // ===== x86_64 macOS syscalls =====
-        // macOS x86_64: rax = 0x2000000 | bsd_number, rdi=arg1, rsi=arg2, rdx=arg3
-        //   syscall
-        X64Code pc;
-        const uint64_t DATA_BASE = DATA_VMADDR;  // data at DATA segment
-        for (size_t k = 0; k < shows.size(); k++) {
+    // We need to know the header total size to compute code file offset,
+    // but the header size depends on LC_UNIXTHREAD which is fixed per arch.
+    // Compute it first:
+    const uint32_t HEADER_SIZE = 32;
+    const uint32_t SEG_CMD_SIZE = 72;
+    const uint32_t LC_UT_HDR = 8;
+    const uint32_t LC_UT_FLAVOR = 8;
+    const uint32_t x64_STATE_SIZE = 43 * 8;   // 344
+    const uint32_t a64_STATE_SIZE = 68 * 4;   // 272
+    const uint32_t LC_UT_SIZE = is_arm64
+        ? (LC_UT_HDR + LC_UT_FLAVOR + a64_STATE_SIZE)
+        : (LC_UT_HDR + LC_UT_FLAVOR + x64_STATE_SIZE);
+    const uint32_t NUM_LOAD_CMDS = 3;
+    const uint32_t LOAD_CMDS_SIZE = 2 * SEG_CMD_SIZE + LC_UT_SIZE;
+    const uint32_t HEADER_TOTAL = HEADER_SIZE + LOAD_CMDS_SIZE;
+    const uint32_t CODE_FILE_OFF = HEADER_TOTAL;
+
+    auto emit_macho_code = [&](uint64_t data_vmaddr) -> std::vector<uint8_t> {
+        const uint64_t DATA_BASE = data_vmaddr;
+        if (!is_arm64) {
+            // ===== x86_64 macOS syscalls =====
+            X64Code pc;
+            for (size_t k = 0; k < shows.size(); k++) {
+                pc.mov_eax(X64_WRITE);
+                pc.mov_edi(1);
+                pc.c.u8(0x48); pc.c.u8(0xBE);
+                pc.c.u64(DATA_BASE + dl.show_offs[k]);
+                pc.mov_edx((uint32_t)(shows[k].text.size() + 1));
+                pc.syscall();
+            }
+            // Prompt
             pc.mov_eax(X64_WRITE);
-            pc.mov_edi(1);   // stdout
-            // lea rsi, [rip + disp] — but this crosses segments.
-            // RIP-relative addressing can reach ±2GB, so from TEXT to DATA
-            // (0x100001000 - 0x1000000XX ≈ 0x1000) it works.
-            // We need to know current code RVA relative to TEXT segment.
-            // Code file offset = header + load commands. Let's compute.
-            // For now, use absolute addressing (mov rsi, imm64).
-            // mov rsi, imm64: 48 BE lo lo lo lo hi hi hi hi
-            pc.c.u8(0x48); pc.c.u8(0xBE);
-            pc.c.u64(DATA_BASE + dl.show_offs[k]);
-            pc.mov_edx((uint32_t)(shows[k].text.size() + 1));
+            pc.mov_edi(1);
+            pc.c.u8(0x48); pc.c.u8(0xBE); pc.c.u64(DATA_BASE + dl.prompt_off);
+            pc.mov_edx((uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
             pc.syscall();
-        }
-        // Prompt
-        pc.mov_eax(X64_WRITE);
-        pc.mov_edi(1);
-        pc.c.u8(0x48); pc.c.u8(0xBE); pc.c.u64(DATA_BASE + dl.prompt_off);
-        pc.mov_edx((uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
-        pc.syscall();
-        // Read(0, buf, 1)
-        pc.mov_eax(X64_READ);
-        pc.mov_edi(0);
-        pc.sub_rsp(16);
-        pc.c.u8(0x48); pc.c.u8(0x8D); pc.c.u8(0x34); pc.c.u8(0x24); // lea rsi, [rsp]
-        pc.mov_edx(1);
-        pc.syscall();
-        pc.add_rsp(16);
-        // exit(0)
-        pc.mov_eax(X64_EXIT);
-        pc.xor_edi();
-        pc.syscall();
-        code = pc.c.b;
-    } else {
-        // ===== ARM64 macOS syscalls =====
-        // macOS ARM64: x16 = syscall number, x0-x5 = args, svc #0x80
-        Arm64Code ac;
-        const uint64_t DATA_BASE = DATA_VMADDR;
-
-        // Helper: mov x16, imm32
-        auto set_x16 = [&](uint32_t val) {
-            ac.mov_imm32(16, val);
-        };
-
-        for (size_t k = 0; k < shows.size(); k++) {
+            // Read(0, buf, 1)
+            pc.mov_eax(X64_READ);
+            pc.mov_edi(0);
+            pc.sub_rsp(16);
+            pc.c.u8(0x48); pc.c.u8(0x8D); pc.c.u8(0x34); pc.c.u8(0x24);
+            pc.mov_edx(1);
+            pc.syscall();
+            pc.add_rsp(16);
+            // exit(0)
+            pc.mov_eax(X64_EXIT);
+            pc.xor_edi();
+            pc.syscall();
+            return pc.c.b;
+        } else {
+            // ===== ARM64 macOS syscalls =====
+            Arm64Code ac;
+            auto set_x16 = [&](uint32_t val) { ac.mov_imm32(16, val); };
+            for (size_t k = 0; k < shows.size(); k++) {
+                set_x16(A64_WRITE);
+                ac.movz(0, 1);
+                ac.mov_imm64(1, DATA_BASE + dl.show_offs[k]);
+                ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1));
+                ac.insn(0xD4001001);
+            }
+            // Prompt
             set_x16(A64_WRITE);
-            ac.movz(0, 1);  // x0 = stdout
-            ac.mov_imm64(1, DATA_BASE + dl.show_offs[k]);  // x1 = &text
-            ac.mov_imm32(2, (uint32_t)(shows[k].text.size() + 1));
-            // svc #0x80
-            ac.insn(0xD4001001);  // svc #0x80
+            ac.movz(0, 1);
+            ac.mov_imm64(1, DATA_BASE + dl.prompt_off);
+            ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
+            ac.insn(0xD4001001);
+            // Read
+            set_x16(A64_READ);
+            ac.movz(0, 0);
+            ac.sub_sp(16);
+            ac.insn(0x910003E1);
+            ac.mov_imm32(2, 1);
+            ac.insn(0xD4001001);
+            ac.add_sp(16);
+            // Exit
+            set_x16(A64_EXIT);
+            ac.movz(0, 0);
+            ac.insn(0xD4001001);
+            return ac.c.b;
         }
-        // Prompt
-        set_x16(A64_WRITE);
-        ac.movz(0, 1);
-        ac.mov_imm64(1, DATA_BASE + dl.prompt_off);
-        ac.mov_imm32(2, (uint32_t)strlen("\r\nPress Enter to exit...\r\n"));
-        ac.insn(0xD4001001);
-        // Read
-        set_x16(A64_READ);
-        ac.movz(0, 0);
-        ac.sub_sp(16);
-        ac.insn(0x910003E1);  // mov x1, sp
-        ac.mov_imm32(2, 1);
-        ac.insn(0xD4001001);
-        ac.add_sp(16);
-        // Exit
-        set_x16(A64_EXIT);
-        ac.movz(0, 0);
-        ac.insn(0xD4001001);
-        code = ac.c.b;
-    }
+    };
+
+    // Pass 1: measure code size.
+    std::vector<uint8_t> code_tmp = emit_macho_code(0x100002000);  // dummy
+    uint32_t code_size = (uint32_t)code_tmp.size();
+
+    // __TEXT segment file size: must contain header + load commands + code.
+    // Round up to page alignment.
+    uint32_t text_seg_size = CODE_FILE_OFF + code_size;
+    while (text_seg_size & (PAGE - 1)) text_seg_size++;
+
+    // __DATA segment follows __TEXT in both file and virtual memory.
+    const uint32_t DATA_FILE_OFF = text_seg_size;
+    const uint64_t DATA_VMADDR = TEXT_VMADDR + text_seg_size;
+    const uint32_t DATA_FILE_SIZE = (uint32_t)data.size();
+    const uint32_t FILE_SIZE = DATA_FILE_OFF + DATA_FILE_SIZE;
+
+    // Pass 2: re-emit with correct DATA_VMADDR.
+    std::vector<uint8_t> code = emit_macho_code(DATA_VMADDR);
 
     // Mach-O header + load commands
     // We use LC_UNIXTHREAD (not LC_MAIN) because LC_MAIN requires dyld, and
@@ -1177,32 +1121,6 @@ static std::vector<uint8_t> build_macho(const std::vector<ShowStatement>& shows,
     //       34 uint64_t. That matches: x[0..28]=29 + fp + lr + sp + pc + cpsr = 34.
     //   So for ARM64, count = 68 (uint32_t words), data = 34 uint64_t = 272 bytes.
 
-    const uint32_t HEADER_SIZE = 32;
-    const uint32_t SEG_CMD_SIZE = 72;
-
-    // LC_UNIXTHREAD sizes
-    // x86_64: 4+4 (cmd) + 4+4 (flavor+count) + 43*8 (state) = 8 + 8 + 344 = 360
-    //   But cmdsize must be 8-aligned. 360 is 8-aligned. Good.
-    // ARM64:  4+4 (cmd) + 4+4 (flavor+count) + 68*4 (state) = 8 + 8 + 272 = 288
-    //   288 is 8-aligned. Good.
-    const uint32_t LC_UT_HDR = 8;   // cmd + cmdsize
-    const uint32_t LC_UT_FLAVOR = 8; // flavor + count
-    const uint32_t x64_STATE_SIZE = 43 * 8;   // 344
-    const uint32_t a64_STATE_SIZE = 68 * 4;   // 272
-    const uint32_t LC_UT_SIZE = is_arm64
-        ? (LC_UT_HDR + LC_UT_FLAVOR + a64_STATE_SIZE)   // 288
-        : (LC_UT_HDR + LC_UT_FLAVOR + x64_STATE_SIZE);  // 360
-
-    const uint32_t NUM_LOAD_CMDS = 3;  // __TEXT, __DATA, LC_UNIXTHREAD
-    const uint32_t LOAD_CMDS_SIZE = 2 * SEG_CMD_SIZE + LC_UT_SIZE;
-    const uint32_t HEADER_TOTAL = HEADER_SIZE + LOAD_CMDS_SIZE;
-    const uint32_t TEXT_FILE_OFF = 0;
-    const uint32_t CODE_FILE_OFF = HEADER_TOTAL;
-    const uint32_t TEXT_FILE_SIZE = PAGE;
-    const uint32_t DATA_FILE_OFF = TEXT_FILE_SIZE;
-    const uint32_t DATA_FILE_SIZE = (uint32_t)data.size();
-    const uint32_t FILE_SIZE = DATA_FILE_OFF + DATA_FILE_SIZE;
-
     // Entry point virtual address (code starts at CODE_FILE_OFF in the file,
     // which maps to TEXT_VMADDR + CODE_FILE_OFF in memory).
     const uint64_t ENTRY_VA = TEXT_VMADDR + CODE_FILE_OFF;
@@ -1229,10 +1147,10 @@ static std::vector<uint8_t> build_macho(const std::vector<ShowStatement>& shows,
     m32(o, LC_SEGMENT_64);
     m32(o+4, SEG_CMD_SIZE);
     memcpy(&img[o+8], "__TEXT\0\0\0\0\0\0\0\0\0\0", 16);
-    m64(o+24, TEXT_VMADDR);
-    m64(o+32, TEXT_FILE_SIZE);
-    m64(o+40, TEXT_FILE_OFF);
-    m64(o+48, TEXT_FILE_SIZE);
+    m64(o+24, TEXT_VMADDR);           // vmaddr
+    m64(o+32, text_seg_size);         // vmsize (page-aligned, covers header+code)
+    m64(o+40, 0);                     // fileoff (__TEXT starts at file offset 0)
+    m64(o+48, text_seg_size);         // filesize (same as vmsize for us)
     m32(o+56, 7);   // maxprot = RWX
     m32(o+60, 5);   // initprot = RX (read+execute)
     m32(o+64, 0);   // nsects
@@ -1240,13 +1158,16 @@ static std::vector<uint8_t> build_macho(const std::vector<ShowStatement>& shows,
     o += SEG_CMD_SIZE;
 
     // Load command 2: LC_SEGMENT_64 __DATA (72 bytes)
+    // vmsize = data size rounded up to page alignment.
+    uint32_t data_vmsize = DATA_FILE_SIZE;
+    while (data_vmsize & (PAGE - 1)) data_vmsize++;
     m32(o, LC_SEGMENT_64);
     m32(o+4, SEG_CMD_SIZE);
     memcpy(&img[o+8], "__DATA\0\0\0\0\0\0\0\0\0\0", 16);
     m64(o+24, DATA_VMADDR);
-    m64(o+32, PAGE);
-    m64(o+40, DATA_FILE_OFF);
-    m64(o+48, DATA_FILE_SIZE);
+    m64(o+32, data_vmsize);           // vmsize (page-rounded)
+    m64(o+40, DATA_FILE_OFF);         // fileoff
+    m64(o+48, DATA_FILE_SIZE);        // filesize
     m32(o+56, 7);   // maxprot = RWX
     m32(o+60, 3);   // initprot = RW
     m32(o+64, 0);
